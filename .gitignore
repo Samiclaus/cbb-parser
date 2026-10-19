@@ -2,3 +2,12 @@ target/
 .idea/
 *.iml
 .DS_Store
+
+# Local TLS truststores (may contain organization-specific certificates)
+parser-truststore.*
+*.truststore
+*.jks
+*.p12
+
+# Generated parser output
+clearwater-music.txt
