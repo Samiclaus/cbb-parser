@@ -15,8 +15,6 @@ if (-not (Test-Path $keytoolPath)) {
     throw "keytool.exe wurde nicht gefunden. Bitte JAVA_HOME prüfen: $env:JAVA_HOME"
 }
 
-# First try the JVM's normal truststore. This is sufficient on machines
-# without TLS inspection (for example, without Zscaler).
 $previousMavenOpts = $env:MAVEN_OPTS
 
 try {
@@ -27,13 +25,14 @@ try {
     $defaultExitCode = $LASTEXITCODE
     $defaultOutput | ForEach-Object { Write-Host $_ }
 
-    if ($defaultExitCode -eq 0) {
+    $defaultOutputText = $defaultOutput -join "`n"
+    $isTlsTrustFailure = $defaultOutputText -match "PKIX path building failed|unable to find valid certification path|certificate_unknown"
+    $isDefaultSuccess = ($defaultExitCode -eq 0) -and (-not $isTlsTrustFailure)
+
+    if ($isDefaultSuccess) {
         Write-Host "Fertig. Ergebnisdatei: $(Join-Path $projectRoot 'clearwater-music.txt')"
         return
     }
-
-    $defaultOutputText = $defaultOutput -join "`n"
-    $isTlsTrustFailure = $defaultOutputText -match "PKIX path building failed|unable to find valid certification path|certificate_unknown"
 
     if (-not $isTlsTrustFailure) {
         throw "Maven-Build fehlgeschlagen (Exit-Code $defaultExitCode). Der Fehler sieht nicht nach einem TLS-Truststore-Problem aus; es erfolgt kein automatischer zweiter Versuch."
@@ -53,10 +52,8 @@ Ohne TLS-Inspektion sollte der Standard-Truststore ausreichen; prüfe in diesem 
         throw "Java-Standard-Truststore nicht gefunden: $javaTruststorePath"
     }
 
-    # Build a fresh local copy only when the default connection failed
-    # specifically because Java did not trust the TLS certificate chain.
     Copy-Item $javaTruststorePath $truststorePath -Force
-    Write-Host "TLS-Trustfehler erkannt. Erstelle lokalen Truststore und importiere das verifizierte Zscaler-Zertifikat."
+    Write-Host "TLS-Trustfehler in der Parser-Ausgabe erkannt. Erstelle lokalen Truststore und importiere das verifizierte Zscaler-Zertifikat."
     & $keytoolPath -importcert -noprompt -alias $alias -file $ZscalerCertificatePath -keystore $truststorePath -storetype JKS -storepass $truststorePassword
 
     if ($LASTEXITCODE -ne 0) {
@@ -67,10 +64,15 @@ Ohne TLS-Inspektion sollte der Standard-Truststore ausreichen; prüfe in diesem 
     $env:MAVEN_OPTS = (($previousMavenOpts, $truststoreArgument, "-Djavax.net.ssl.trustStorePassword=$truststorePassword", "-Djavax.net.ssl.trustStoreType=JKS" | Where-Object { $_ }) -join " ")
 
     Write-Host "Wiederhole Maven-Build mit lokal ergänzt­em Truststore..."
-    & mvn clean package
+    $fallbackOutput = @(& mvn clean package 2>&1)
+    $fallbackExitCode = $LASTEXITCODE
+    $fallbackOutput | ForEach-Object { Write-Host $_ }
 
-    if ($LASTEXITCODE -ne 0) {
-        throw "Maven-Build ist auch mit dem ergänzten Truststore fehlgeschlagen (Exit-Code $LASTEXITCODE)."
+    $fallbackOutputText = $fallbackOutput -join "`n"
+    $fallbackHasTlsFailure = $fallbackOutputText -match "PKIX path building failed|unable to find valid certification path|certificate_unknown"
+
+    if (($fallbackExitCode -ne 0) -or $fallbackHasTlsFailure) {
+        throw "Maven-Build ist auch mit dem ergänzten Truststore fehlgeschlagen. Exit-Code: $fallbackExitCode. Prüfe die Ausgabe oben."
     }
 
     Write-Host "Fertig. Ergebnisdatei: $(Join-Path $projectRoot 'clearwater-music.txt')"
