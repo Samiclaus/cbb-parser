@@ -1,30 +1,65 @@
-name: Maven build
+name: Run Clearwater music parser
 
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "clearwater-music.txt"
+  schedule:
+    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: clearwater-music-parser
+  cancel-in-progress: false
 
 jobs:
-  build:
+  parse:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: "17"
           cache: maven
+
       - name: Build and run parser
         run: mvn --batch-mode clean package
-      - name: Upload parsed results
+
+      - name: Check parser output
+        run: |
+          test -s clearwater-music.txt
+          echo "Parsed $(grep -Ec '^[0-9]+\\. ' clearwater-music.txt) music title(s)."
+
+      - name: Commit updated results
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # The output is intentionally gitignored for local development,
+          # but this workflow tracks and updates it in the repository.
+          git add -f clearwater-music.txt
+
+          if git diff --cached --quiet; then
+            echo "No changes to clearwater-music.txt."
+            exit 0
+          fi
+
+          git commit -m "Update parsed Clearwater music list"
+          git push
+
+      - name: Upload parsed results as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: clearwater-music
           path: clearwater-music.txt
-          if-no-files-found: warn
+          if-no-files-found: error
