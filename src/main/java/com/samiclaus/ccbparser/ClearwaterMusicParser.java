@@ -14,20 +14,24 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 
 public final class ClearwaterMusicParser {
     private static final String PAGE_URL_PREFIX =
             "https://www.clearwatercommunityband.com/copy-of-music-template-";
     private static final int MAX_PAGE = 999;
-    private static final int CONCURRENCY = 10;
     private static final int CONSECUTIVE_404_LIMIT = 3;
+    private static final long REQUEST_DELAY_MILLIS = 3_000;
+    private static final int MAX_429_RETRIES = 5;
+    private static final long INITIAL_429_BACKOFF_MILLIS = 30_000;
+    private static final long MAX_429_BACKOFF_MILLIS = 5 * 60_000;
     private static final Path OUTPUT_FILE = Path.of("clearwater-music.txt");
 
     private ClearwaterMusicParser() {
@@ -35,8 +39,8 @@ public final class ClearwaterMusicParser {
 
     public static void main(String[] args) throws IOException {
         int maxPage = readPositiveIntProperty("ccb.maxPage", MAX_PAGE);
-        int concurrency = readPositiveIntProperty("ccb.concurrency", CONCURRENCY);
         int missingLimit = readPositiveIntProperty("ccb.consecutive404Limit", CONSECUTIVE_404_LIMIT);
+        long requestDelay = readNonNegativeLongProperty("ccb.requestDelayMillis", REQUEST_DELAY_MILLIS);
         Path output = Path.of(System.getProperty("ccb.output", OUTPUT_FILE.toString()));
 
         HttpClient client = HttpClient.newBuilder()
@@ -44,7 +48,7 @@ public final class ClearwaterMusicParser {
                 .followRedirects(HttpClient.Redirect.NORMAL)
                 .build();
 
-        List<PageResult> results = scan(client, maxPage, concurrency, missingLimit);
+        List<PageResult> results = scan(client, maxPage, missingLimit, requestDelay);
         String report = formatReport(results);
         Files.writeString(output, report, StandardCharsets.UTF_8);
 
@@ -57,50 +61,34 @@ public final class ClearwaterMusicParser {
     private static List<PageResult> scan(
             HttpClient client,
             int maxPage,
-            int concurrency,
-            int missingLimit) {
+            int missingLimit,
+            long requestDelayMillis) {
 
         List<PageResult> accepted = new ArrayList<>();
-        ExecutorService executor = Executors.newFixedThreadPool(concurrency);
         int consecutive404s = 0;
 
-        try {
-            for (int first = 1; first <= maxPage && consecutive404s < missingLimit; first += concurrency) {
-                int last = Math.min(maxPage, first + concurrency - 1);
-                List<Future<PageResult>> futures = new ArrayList<>();
-
-                for (int page = first; page <= last; page++) {
-                    final int pageNumber = page;
-                    futures.add(executor.submit(() -> fetchPage(client, pageNumber)));
-                }
-
-                for (Future<PageResult> future : futures) {
-                    PageResult result;
-                    try {
-                        result = future.get();
-                    } catch (Exception exception) {
-                        result = new PageResult(-1, "ERROR", List.of(),
-                                "Unexpected fetch failure: " + exception.getMessage());
-                    }
-
-                    if (result.page() == -1) {
-                        accepted.add(result);
-                        continue;
-                    }
-
-                    if ("404".equals(result.status())) {
-                        consecutive404s++;
-                        if (consecutive404s >= missingLimit) {
-                            break;
-                        }
-                    } else {
-                        consecutive404s = 0;
-                        accepted.add(result);
-                    }
-                }
+        // Deliberately send requests one at a time. Parallel requests caused
+        // the website to rate-limit the parser with HTTP 429 responses.
+        for (int page = 1; page <= maxPage && consecutive404s < missingLimit; page++) {
+            if (page > 1 && !sleep(requestDelayMillis)) {
+                accepted.add(new PageResult(page, "ERROR", List.of(),
+                        "Request delay interrupted; stopping scan."));
+                break;
             }
-        } finally {
-            executor.shutdownNow();
+
+            PageResult result = fetchPage(client, page);
+
+            if ("404".equals(result.status())) {
+                consecutive404s++;
+                continue;
+            }
+
+            consecutive404s = 0;
+            accepted.add(result);
+
+            if ("ERROR".equals(result.status()) && result.detail().contains("interrupted")) {
+                break;
+            }
         }
 
         return accepted;
@@ -115,38 +103,90 @@ public final class ClearwaterMusicParser {
                 .GET()
                 .build();
 
-        try {
-            HttpResponse<String> response = client.send(
-                    request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
-            int statusCode = response.statusCode();
+        for (int attempt = 0; ; attempt++) {
+            try {
+                HttpResponse<String> response = client.send(
+                        request, HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
+                int statusCode = response.statusCode();
 
-            if (statusCode == 404) {
-                return new PageResult(pageNumber, "404", List.of(), url);
+                if (statusCode == 429) {
+                    if (attempt >= MAX_429_RETRIES) {
+                        return new PageResult(pageNumber, "HTTP 429", List.of(),
+                                url + " — rate limit persisted after " + MAX_429_RETRIES + " retries");
+                    }
+
+                    long waitMillis = get429WaitMillis(response, attempt);
+                    System.out.println("HTTP 429 on page " + pageNumber + ". Waiting "
+                            + (waitMillis / 1_000) + " seconds before retry "
+                            + (attempt + 1) + "/" + MAX_429_RETRIES + ".");
+                    if (!sleep(waitMillis)) {
+                        return new PageResult(pageNumber, "ERROR", List.of(),
+                                "Request interrupted while waiting after HTTP 429.");
+                    }
+                    continue;
+                }
+
+                if (statusCode == 404) {
+                    return new PageResult(pageNumber, "404", List.of(), url);
+                }
+
+                if (statusCode < 200 || statusCode >= 300) {
+                    return new PageResult(pageNumber, "HTTP " + statusCode, List.of(), url);
+                }
+
+                Document document = Jsoup.parse(response.body(), url);
+                Set<String> uniqueTitles = new LinkedHashSet<>();
+                Elements headings = document.select("h3, h4");
+
+                for (Element heading : headings) {
+                    String title = heading.text().replaceAll("\\s+", " ").trim();
+                    if (isLikelyMusicTitle(title)) {
+                        uniqueTitles.add(title);
+                    }
+                }
+
+                return new PageResult(pageNumber, "OK", List.copyOf(uniqueTitles), url);
+            } catch (InterruptedException exception) {
+                Thread.currentThread().interrupt();
+                return new PageResult(pageNumber, "ERROR", List.of(),
+                        "Request interrupted: " + exception.getMessage());
+            } catch (IOException | IllegalArgumentException exception) {
+                return new PageResult(pageNumber, "ERROR", List.of(),
+                        url + " — " + exception.getMessage());
             }
+        }
+    }
 
-            if (statusCode < 200 || statusCode >= 300) {
-                return new PageResult(pageNumber, "HTTP " + statusCode, List.of(), url);
-            }
-
-            Document document = Jsoup.parse(response.body(), url);
-            Set<String> uniqueTitles = new LinkedHashSet<>();
-            Elements headings = document.select("h3, h4");
-
-            for (Element heading : headings) {
-                String title = heading.text().replaceAll("\\s+", " ").trim();
-                if (isLikelyMusicTitle(title)) {
-                    uniqueTitles.add(title);
+    private static long get429WaitMillis(HttpResponse<?> response, int attempt) {
+        String retryAfter = response.headers().firstValue("Retry-After").orElse(null);
+        if (retryAfter != null) {
+            try {
+                return Math.max(1_000, Long.parseLong(retryAfter.trim()) * 1_000);
+            } catch (NumberFormatException ignored) {
+                try {
+                    Instant retryAt = ZonedDateTime.parse(
+                            retryAfter, DateTimeFormatter.RFC_1123_DATE_TIME).toInstant();
+                    return Math.max(1_000, Duration.between(Instant.now(), retryAt).toMillis());
+                } catch (DateTimeParseException ignoredDate) {
+                    // Use exponential backoff if the header is missing or invalid.
                 }
             }
+        }
 
-            return new PageResult(pageNumber, "OK", List.copyOf(uniqueTitles), url);
+        long multiplier = 1L << Math.min(attempt, 10);
+        return Math.min(INITIAL_429_BACKOFF_MILLIS * multiplier, MAX_429_BACKOFF_MILLIS);
+    }
+
+    private static boolean sleep(long millis) {
+        if (millis <= 0) {
+            return true;
+        }
+        try {
+            Thread.sleep(millis);
+            return true;
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            return new PageResult(pageNumber, "ERROR", List.of(),
-                    "Request interrupted: " + exception.getMessage());
-        } catch (IOException | IllegalArgumentException exception) {
-            return new PageResult(pageNumber, "ERROR", List.of(),
-                    url + " — " + exception.getMessage());
+            return false;
         }
     }
 
@@ -204,6 +244,25 @@ public final class ClearwaterMusicParser {
         try {
             int parsed = Integer.parseInt(value);
             if (parsed > 0) {
+                return parsed;
+            }
+        } catch (NumberFormatException ignored) {
+            // Fall back to the default value below.
+        }
+
+        System.err.println("Ignoring invalid value for " + property + ": " + value);
+        return defaultValue;
+    }
+
+    private static long readNonNegativeLongProperty(String property, long defaultValue) {
+        String value = System.getProperty(property);
+        if (value == null || value.isBlank()) {
+            return defaultValue;
+        }
+
+        try {
+            long parsed = Long.parseLong(value);
+            if (parsed >= 0) {
                 return parsed;
             }
         } catch (NumberFormatException ignored) {
