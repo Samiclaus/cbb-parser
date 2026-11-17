@@ -1,12 +1,6 @@
 name: Run Clearwater music parser
 
 on:
-  push:
-    branches: [main]
-    paths-ignore:
-      - "clearwater-music.txt"
-  schedule:
-    - cron: "0 6 * * *"
   workflow_dispatch:
 
 permissions:
