@@ -69,7 +69,10 @@ mvn clean package
 ## Parser behavior
 
 - Starts at copy-of-music-template-1, then checks numbered pages in ascending order.
-- Fetches up to 10 pages concurrently.
+- Sends requests sequentially, with a default pause of 3 seconds between page requests.
+- Retries HTTP 429 (rate limit) responses up to five times. The parser honors the
+  server's Retry-After header when present; otherwise it uses exponential backoff
+  starting at 30 seconds and increasing up to 5 minutes.
 - Stops after three consecutive HTTP 404 responses.
 - Extracts distinct h3 and h4 headings per page.
 - Logs non-200 responses and request errors to the output file.
@@ -81,12 +84,12 @@ The website may change its page structure, so the output should be reviewed if t
 These Java system properties can be supplied to Maven's exec plugin:
 
 - ccb.maxPage: maximum page number (default 999)
-- ccb.concurrency: number of concurrent requests (default 10)
 - ccb.consecutive404Limit: consecutive 404s before stopping (default 3)
+- ccb.requestDelayMillis: pause between requests in milliseconds (default 3000; set to 0 to disable)
 - ccb.output: output path (default clearwater-music.txt)
 
 For example:
 
 ~~~bash
-mvn -Dccb.maxPage=100 -Dccb.concurrency=5 clean package
+mvn -Dccb.maxPage=100 -Dccb.requestDelayMillis=5000 clean package
 ~~~
